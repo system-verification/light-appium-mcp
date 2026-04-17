@@ -1,0 +1,13 @@
+{
+  "name": "light-appium-mcp",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "server.js",
+  "bin": "server.js",
+  "files": ["server.js", "parser.js"],
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "axios": "^1.15.0",
+    "zod": "^3.25.76"
+  }
+}
