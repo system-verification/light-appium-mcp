@@ -10,6 +10,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import axios from "axios";
 import { parsePageSource, formatLocatorReport } from "./parser.js";
+import { startRecording, stopRecording, isRecording, consolidateSteps, deduplicateScreens } from "./recorder.js";
 
 const APPIUM_HOST = process.env.APPIUM_HOST || "http://localhost:4723";
 
@@ -88,6 +89,66 @@ server.registerTool(
         });
 
         return { content: [{ type: "text", text }] };
+    }
+);
+
+server.registerTool(
+    "start_recording",
+    {
+        description: "Start recording actions from an Appium session. Polls Appium server logs in the background to capture user interactions (taps, typing, etc.) along with XML page source snapshots.",
+        inputSchema: {
+            sessionId: z.string().optional().describe("The Appium session ID. If not provided, uses the first active session."),
+        },
+    },
+    async ({ sessionId }) => {
+        const resolvedSessionId = sessionId || await getFirstSessionId();
+
+        if (isRecording(resolvedSessionId)) {
+            return { content: [{ type: "text", text: `Already recording session ${resolvedSessionId}. Call stop_recording first.` }] };
+        }
+
+        try {
+            await startRecording(resolvedSessionId, APPIUM_HOST);
+        } catch (err) {
+            return { content: [{ type: "text", text: `Failed to start recording: ${err.message}` }], isError: true };
+        }
+        return { content: [{ type: "text", text: `Recording started for session ${resolvedSessionId}. Perform actions in Appium Inspector, then call stop_recording to retrieve them.` }] };
+    }
+);
+
+server.registerTool(
+    "stop_recording",
+    {
+        description: "Stop recording actions and return consolidated steps with compact screen representations. Actions are merged (e.g. findElement+click becomes a single 'tap') and page sources are deduplicated and parsed into interactive element lists.",
+        inputSchema: {
+            sessionId: z.string().optional().describe("The Appium session ID. If not provided, uses the first active session."),
+        },
+    },
+    async ({ sessionId }) => {
+        const resolvedSessionId = sessionId || await getFirstSessionId();
+
+        if (!isRecording(resolvedSessionId)) {
+            return { content: [{ type: "text", text: `No active recording for session ${resolvedSessionId}.` }] };
+        }
+
+        const recording = await stopRecording(resolvedSessionId);
+        const consolidated = consolidateSteps(recording.steps);
+        const { screens, actions } = deduplicateScreens(
+            consolidated, recording.initialPageSource, parsePageSource
+        );
+
+        const output = {
+            summary: {
+                startedAt: recording.startedAt,
+                stoppedAt: recording.stoppedAt,
+                totalActions: actions.length,
+                platform: screens[0]?.platform || "unknown",
+            },
+            screens,
+            actions,
+        };
+
+        return { content: [{ type: "text", text: JSON.stringify(output, null, 2) }] };
     }
 );
 
