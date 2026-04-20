@@ -98,9 +98,32 @@ async function pollLogs(sessionId) {
 
     const logs = await fetchLogs(sessionId, state.appiumHost);
 
-    // Logs are not cleared between fetches — skip entries we've already seen
-    const newLogs = logs.slice(state.logOffset);
-    state.logOffset = logs.length;
+    // The log buffer is capped (e.g., 3000 entries) and rotates — offset-based
+    // slicing doesn't work. Instead, find new entries by timestamp comparison.
+    let newLogs;
+    if (state.lastSeenTimestamp == null) {
+        // No baseline timestamp — treat all as new (shouldn't normally happen)
+        newLogs = logs;
+    } else {
+        // Find the index of the first entry AFTER our last seen timestamp
+        let startIdx = logs.length; // default: nothing new
+        for (let i = logs.length - 1; i >= 0; i--) {
+            const ts = typeof logs[i] === "object" ? logs[i].timestamp : null;
+            if (ts != null && ts <= state.lastSeenTimestamp) {
+                startIdx = i + 1;
+                break;
+            }
+        }
+        newLogs = logs.slice(startIdx);
+    }
+
+    // Update the marker to the latest entry's timestamp
+    if (logs.length > 0) {
+        const lastEntry = logs[logs.length - 1];
+        const ts = typeof lastEntry === "object" ? lastEntry.timestamp : null;
+        if (ts != null) state.lastSeenTimestamp = ts;
+    }
+
 
     for (const entry of newLogs) {
         // entry may be { message: "...", level: "...", timestamp: ... } or just a string
@@ -131,17 +154,22 @@ export async function startRecording(sessionId, appiumHost) {
         await stopRecording(sessionId);
     }
 
-    // Fetch existing logs to establish offset baseline (throw if log access is blocked)
+    // Fetch existing logs to establish baseline (throw if log access is blocked)
     const existingLogs = await fetchLogs(sessionId, appiumHost, { throwOnError: true });
 
     // Capture initial page source
     const initialPageSource = await fetchPageSource(sessionId, appiumHost);
 
+    // Use the last log entry's timestamp as our marker for detecting new entries,
+    // since the log buffer is capped and offset-based slicing won't work.
+    const lastEntry = existingLogs.length > 0 ? existingLogs[existingLogs.length - 1] : null;
+    const lastTimestamp = lastEntry && typeof lastEntry === "object" ? lastEntry.timestamp : null;
+
     const state = {
         appiumHost,
         steps: [],
         stepIndex: 0,
-        logOffset: existingLogs.length,
+        lastSeenTimestamp: lastTimestamp,
         startedAt: new Date().toISOString(),
         initialPageSource,
         interval: setInterval(() => pollLogs(sessionId), 1000),
@@ -306,4 +334,201 @@ export function deduplicateScreens(actions, initialPageSource, parsePageSourceFn
     });
 
     return { screens, actions: compactActions };
+}
+
+// --- Flow building: high-level summary with element names, screen names, deduplication ---
+
+/**
+ * Resolves a human-readable element name from a locator
+ * by matching against the screen's element list.
+ */
+function resolveElementName(locator, screenElements) {
+    if (!locator || !screenElements?.length) return null;
+
+    const { strategy, value } = locator;
+    const bestName = (el) => el.desc || el.text || el.rid || null;
+
+    if (strategy === "accessibility id") {
+        const match = screenElements.find((e) => e.desc === value || e.rid === value);
+        return match ? bestName(match) : value;
+    }
+
+    if (strategy === "id") {
+        const match = screenElements.find((e) => e.rid === value);
+        return match ? bestName(match) : value.split("/").pop();
+    }
+
+    if (strategy === "-android uiautomator") {
+        const textMatch = value.match(/\.text\("([^"]+)"\)/);
+        if (textMatch) return textMatch[1];
+        const descMatch = value.match(/description\("([^"]+)"\)/);
+        if (descMatch) return descMatch[1];
+        const ridMatch = value.match(/resourceId\("([^"]+)"\)/);
+        if (ridMatch) {
+            const match = screenElements.find((e) => e.rid === ridMatch[1]);
+            return match ? bestName(match) : ridMatch[1];
+        }
+        return null;
+    }
+
+    if (strategy === "xpath") {
+        const attrMatch = value.match(
+            /@(?:text|content-desc|name|label|resource-id)='([^']+)'/
+        );
+        return attrMatch ? attrMatch[1] : null;
+    }
+
+    if (strategy === "-ios predicate string") {
+        const nameMatch = value.match(/name\s*==\s*['"]([^'"]+)['"]/);
+        const labelMatch = value.match(/label\s*==\s*['"]([^'"]+)['"]/);
+        return nameMatch?.[1] || labelMatch?.[1] || null;
+    }
+
+    return null;
+}
+
+/**
+ * Finds which screen an action's locator best matches by checking
+ * if any screen's elements contain a matching identifier.
+ */
+function matchActionToScreen(locator, screens) {
+    if (!locator) return -1;
+
+    const { strategy, value } = locator;
+
+    for (const screen of screens) {
+        for (const el of screen.elements) {
+            if (strategy === "accessibility id" && (el.desc === value || el.rid === value))
+                return screen.screenIndex;
+            if (strategy === "id" && el.rid === value)
+                return screen.screenIndex;
+
+            if (strategy === "-android uiautomator") {
+                const ridMatch = value.match(/resourceId\("([^"]+)"\)/);
+                const textMatch = value.match(/\.text\("([^"]+)"\)/);
+                const descMatch = value.match(/description\("([^"]+)"\)/);
+                if (ridMatch && el.rid === ridMatch[1]) return screen.screenIndex;
+                if (textMatch && el.text === textMatch[1]) return screen.screenIndex;
+                if (descMatch && el.desc === descMatch[1]) return screen.screenIndex;
+            }
+
+            if (strategy === "-ios predicate string") {
+                const nameMatch = value.match(/name\s*==\s*['"]([^'"]+)['"]/);
+                const labelMatch = value.match(/label\s*==\s*['"]([^'"]+)['"]/);
+                if (nameMatch && el.desc === nameMatch[1]) return screen.screenIndex;
+                if (labelMatch && el.text === labelMatch[1]) return screen.screenIndex;
+            }
+        }
+    }
+
+    return -1;
+}
+
+/**
+ * Detects a screen name from its elements by finding
+ * the topmost text element (likely the header/title).
+ */
+function detectScreenName(screen) {
+    if (!screen?.elements?.length) return null;
+
+    const candidates = screen.elements
+        .filter((e) => e.text && /TextView|Text|StaticText/.test(e.cls))
+        .map((e) => {
+            const m = e.bounds.match(/\[\d+,(\d+)\]/);
+            return { text: e.text, y: m ? parseInt(m[1]) : Infinity };
+        })
+        .sort((a, b) => a.y - b.y);
+
+    return candidates[0]?.text || null;
+}
+
+/**
+ * Removes repeated action sequences from the flow.
+ * Matches on action+elementName signature (ignores typed values).
+ */
+function deduplicateFlow(flow, depth = 0) {
+    if (flow.length < 6 || depth > 10) return { flow, removedCount: 0 };
+
+    const sig = (f) => `${f.action}|${f.elementName || ""}`;
+
+    for (let len = Math.min(15, Math.floor(flow.length / 2)); len >= 3; len--) {
+        for (let start = 0; start <= flow.length - len * 2; start++) {
+            const pattern = [];
+            for (let k = 0; k < len; k++) pattern.push(sig(flow[start + k]));
+
+            let repeats = 1;
+            let pos = start + len;
+            while (pos + len <= flow.length) {
+                let matches = true;
+                for (let k = 0; k < len; k++) {
+                    if (sig(flow[pos + k]) !== pattern[k]) {
+                        matches = false;
+                        break;
+                    }
+                }
+                if (matches) {
+                    repeats++;
+                    pos += len;
+                } else {
+                    break;
+                }
+            }
+
+            if (repeats >= 2) {
+                const removed = (repeats - 1) * len;
+                const before = flow.slice(0, start);
+                const kept = flow.slice(start, start + len);
+                const after = flow.slice(start + len * repeats);
+                const result = deduplicateFlow([...before, ...kept, ...after], depth + 1);
+                return {
+                    flow: result.flow,
+                    removedCount: removed + result.removedCount,
+                };
+            }
+        }
+    }
+
+    return { flow, removedCount: 0 };
+}
+
+/**
+ * Builds a high-level flow summary from consolidated actions and screens.
+ * Resolves element names, detects screen names/transitions, and deduplicates.
+ */
+export function buildFlow(actions, screens) {
+    // Name each screen by its topmost text element
+    const screenNames = screens.map((s) => detectScreenName(s) || `Screen ${s.screenIndex}`);
+
+    // Resolve screen assignment and element names for each action
+    const enriched = actions.map((action) => {
+        let screenIdx = action.screenIndex;
+        if (action.locator) {
+            const matched = matchActionToScreen(action.locator, screens);
+            if (matched >= 0) screenIdx = matched;
+        }
+
+        const screen = screens[screenIdx];
+        const elementName = resolveElementName(action.locator, screen?.elements);
+
+        const entry = { action: action.action, screen: screenNames[screenIdx] };
+        if (elementName) entry.elementName = elementName;
+        if (action.text) entry.value = action.text;
+        return entry;
+    });
+
+    // Detect screen transitions
+    for (let i = 0; i < enriched.length - 1; i++) {
+        if (enriched[i + 1].screen !== enriched[i].screen) {
+            enriched[i].navigatesTo = enriched[i + 1].screen;
+        }
+    }
+
+    // Deduplicate repeated sequences
+    const { flow, removedCount } = deduplicateFlow(enriched);
+
+    return {
+        screenNames: screenNames.map((name, i) => ({ screenIndex: i, name })),
+        steps: flow,
+        deduplication: removedCount > 0 ? { removedActions: removedCount } : null,
+    };
 }

@@ -10,7 +10,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import axios from "axios";
 import { parsePageSource, formatLocatorReport } from "./parser.js";
-import { startRecording, stopRecording, isRecording, consolidateSteps, deduplicateScreens } from "./recorder.js";
+import { startRecording, stopRecording, isRecording, consolidateSteps, deduplicateScreens, buildFlow } from "./recorder.js";
 
 const APPIUM_HOST = process.env.APPIUM_HOST || "http://localhost:4723";
 
@@ -119,7 +119,7 @@ server.registerTool(
 server.registerTool(
     "stop_recording",
     {
-        description: "Stop recording actions and return consolidated steps with compact screen representations. Actions are merged (e.g. findElement+click becomes a single 'tap') and page sources are deduplicated and parsed into interactive element lists.",
+        description: "Stop recording and return a high-level flow summary. Raw actions are merged (findElement+click → 'tap'), element names are resolved from screen context, screens are auto-named by their header text, and repeated action sequences are deduplicated. Output: summary, named screens with element inventories, and a flow array of {action, elementName, screen, value?, navigatesTo?} steps.",
         inputSchema: {
             sessionId: z.string().optional().describe("The Appium session ID. If not provided, uses the first active session."),
         },
@@ -137,15 +137,22 @@ server.registerTool(
             consolidated, recording.initialPageSource, parsePageSource
         );
 
+        const flow = buildFlow(actions, screens);
+
         const output = {
             summary: {
                 startedAt: recording.startedAt,
                 stoppedAt: recording.stoppedAt,
-                totalActions: actions.length,
+                totalRawActions: actions.length,
+                totalFlowSteps: flow.steps.length,
                 platform: screens[0]?.platform || "unknown",
+                deduplication: flow.deduplication,
             },
-            screens,
-            actions,
+            screens: screens.map((s, i) => ({
+                ...s,
+                name: flow.screenNames[i]?.name,
+            })),
+            flow: flow.steps,
         };
 
         return { content: [{ type: "text", text: JSON.stringify(output, null, 2) }] };
