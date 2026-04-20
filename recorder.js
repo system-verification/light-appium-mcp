@@ -27,40 +27,59 @@ const ACTION_PATTERNS = [
     /\/appium\/device\/hide_keyboard$/,
 ];
 
+// Endpoints that represent verification intent (reading element text/attributes)
+const VERIFY_PATTERNS = [
+    /\/element\/[^/]+\/text$/,
+    /\/element\/[^/]+\/attribute\/[^/]+$/,
+];
+
+// Extract element-id from Appium endpoint URLs
+const ELEMENT_ID_RE = /\/element\/([^/]+)\//;
+
 // Log line regex: [HTTP] --> POST /session/xxx/element/yyy/click {...}
 const LOG_LINE_RE = /\[HTTP\]\s+-->\s+(GET|POST|PUT|DELETE|PATCH)\s+(\/session\/[^\s]+?)(?:\s+(.+))?$/;
+
+// Response line regex: [HTTP] <-- GET /session/xxx/element/yyy/text 200 5.123 ms - {"value":"Hello"}
+const LOG_RESPONSE_RE = /\[HTTP\]\s+<--\s+(GET|POST|PUT|DELETE|PATCH)\s+(\/session\/[^\s]+?)\s+(\d+)\s+[\d.]+\s+ms\s+-\s+(.+)$/;
 
 function parseLogLine(line) {
     const match = line.match(LOG_LINE_RE);
     if (!match) return null;
 
     const [, method, endpoint, bodyStr] = match;
-
-    // Only care about action-relevant endpoints
-    // Strip the /session/:id prefix to match against patterns
     const pathWithoutSession = endpoint.replace(/^\/session\/[^/]+/, "");
-    const isAction = ACTION_PATTERNS.some((re) => re.test(pathWithoutSession));
-    if (!isAction) return null;
 
     let params = null;
     if (bodyStr) {
         try {
             params = JSON.parse(bodyStr.trim());
         } catch {
-            // body wasn't valid JSON, store as-is
             params = { raw: bodyStr.trim() };
         }
     }
 
-    // Derive action name from the last meaningful path segment
     const segments = pathWithoutSession.split("/").filter(Boolean);
     let action = segments[segments.length - 1];
-    // For /element/:id/value, /element/:id/click, etc.
     if (segments.length >= 2 && segments[0] === "element") {
         action = segments[segments.length - 1];
     }
 
-    return { method, endpoint, action, params };
+    return { method, endpoint, pathWithoutSession, action, params };
+}
+
+function parseResponseLine(line) {
+    const match = line.match(LOG_RESPONSE_RE);
+    if (!match) return null;
+
+    const [, method, endpoint, statusCode, bodyStr] = match;
+    const pathWithoutSession = endpoint.replace(/^\/session\/[^/]+/, "");
+    let body = null;
+    if (bodyStr) {
+        try { body = JSON.parse(bodyStr.trim()); }
+        catch { body = null; }
+    }
+
+    return { method, endpoint, pathWithoutSession, statusCode, body };
 }
 
 async function fetchLogs(sessionId, appiumHost, { throwOnError = false } = {}) {
@@ -128,23 +147,86 @@ async function pollLogs(sessionId) {
     for (const entry of newLogs) {
         // entry may be { message: "...", level: "...", timestamp: ... } or just a string
         const message = typeof entry === "string" ? entry : entry.message || "";
+        const entryTimestamp = typeof entry === "object" && entry.timestamp
+            ? new Date(entry.timestamp).toISOString()
+            : new Date().toISOString();
 
-        const parsed = parseLogLine(message);
-        if (!parsed) continue;
+        // --- Try request line ---
+        const reqParsed = parseLogLine(message);
+        if (reqParsed) {
+            const isAction = ACTION_PATTERNS.some((re) => re.test(reqParsed.pathWithoutSession));
+            const isVerify = VERIFY_PATTERNS.some((re) => re.test(reqParsed.pathWithoutSession));
 
-        // Capture page source right after detecting an action
-        const pageSource = await fetchPageSource(sessionId, state.appiumHost);
+            if (!isAction && !isVerify) continue;
 
-        state.steps.push({
-            index: state.stepIndex++,
-            timestamp: typeof entry === "object" && entry.timestamp
-                ? new Date(entry.timestamp).toISOString()
-                : new Date().toISOString(),
-            action: parsed.action,
-            endpoint: parsed.endpoint,
-            params: parsed.params,
-            pageSource,
-        });
+            // Track findElement params for element-id mapping
+            if (reqParsed.action === "element" || reqParsed.action === "elements") {
+                state.pendingFind = reqParsed.params;
+            }
+
+            if (isVerify) {
+                // getText or getAttribute request — record as verify step
+                const elementIdMatch = reqParsed.endpoint.match(ELEMENT_ID_RE);
+                const elementId = elementIdMatch?.[1];
+                const locator = elementId ? state.elementIdMap.get(elementId) : null;
+                const attrMatch = reqParsed.pathWithoutSession.match(/\/attribute\/(.+)$/);
+
+                const pageSource = await fetchPageSource(sessionId, state.appiumHost);
+                state.pendingVerifyStepIndex = state.steps.length;
+                state.steps.push({
+                    index: state.stepIndex++,
+                    timestamp: entryTimestamp,
+                    action: attrMatch ? "attribute" : "text",
+                    endpoint: reqParsed.endpoint,
+                    params: {
+                        using: locator?.strategy,
+                        value: locator?.value,
+                        text: null, // filled from response line
+                        attributeName: attrMatch?.[1] || null,
+                    },
+                    pageSource,
+                });
+                continue;
+            }
+
+            // Regular action — existing behavior
+            const pageSource = await fetchPageSource(sessionId, state.appiumHost);
+            state.steps.push({
+                index: state.stepIndex++,
+                timestamp: entryTimestamp,
+                action: reqParsed.action,
+                endpoint: reqParsed.endpoint,
+                params: reqParsed.params,
+                pageSource,
+            });
+            continue;
+        }
+
+        // --- Try response line ---
+        const resParsed = parseResponseLine(message);
+        if (resParsed && resParsed.statusCode === "200") {
+            // findElement response: map returned element-id to the locator
+            if (/\/element$/.test(resParsed.pathWithoutSession) && resParsed.body?.value) {
+                const val = resParsed.body.value;
+                const elementId = val.ELEMENT || Object.values(val).find((v) => typeof v === "string");
+                if (elementId && state.pendingFind) {
+                    state.elementIdMap.set(elementId, {
+                        strategy: state.pendingFind.using,
+                        value: state.pendingFind.value,
+                    });
+                }
+            }
+
+            // getText/getAttribute response: attach value to pending verify step
+            const isVerifyResponse = VERIFY_PATTERNS.some((re) => re.test(resParsed.pathWithoutSession));
+            if (isVerifyResponse && state.pendingVerifyStepIndex != null) {
+                const textValue = resParsed.body?.value;
+                if (textValue != null && state.steps[state.pendingVerifyStepIndex]) {
+                    state.steps[state.pendingVerifyStepIndex].params.text = String(textValue);
+                }
+                state.pendingVerifyStepIndex = null;
+            }
+        }
     }
 }
 
@@ -173,6 +255,9 @@ export async function startRecording(sessionId, appiumHost) {
         startedAt: new Date().toISOString(),
         initialPageSource,
         interval: setInterval(() => pollLogs(sessionId), 1000),
+        elementIdMap: new Map(),       // Appium element-id → { strategy, value }
+        pendingFind: null,             // last findElement params for element-id correlation
+        pendingVerifyStepIndex: null,  // index of step awaiting response value
     };
 
     recordings.set(sessionId, state);
@@ -221,6 +306,8 @@ const ACTION_NAME_MAP = {
     keys: "type",
     actions: "gesture",
     perform: "gesture",
+    text: "verify",
+    attribute: "verify",
 };
 
 /**
@@ -252,6 +339,10 @@ export function consolidateSteps(steps) {
                 if (action === "type") {
                     entry.text = next.params?.text || next.params?.value || "";
                 }
+                if (action === "verify") {
+                    entry.text = next.params?.text || "";
+                    entry.attributeName = next.params?.attributeName || null;
+                }
                 consolidated.push(entry);
                 i++; // skip the next step since we merged it
             }
@@ -267,6 +358,14 @@ export function consolidateSteps(steps) {
             timestamp: step.timestamp,
             pageSource: step.pageSource,
         };
+        if (action === "verify" && step.params) {
+            // Standalone verify (no preceding find) — use embedded locator
+            if (step.params.using) {
+                entry.locator = { strategy: step.params.using, value: step.params.value };
+            }
+            entry.text = step.params.text || "";
+            entry.attributeName = step.params.attributeName || null;
+        }
         consolidated.push(entry);
     }
 
@@ -513,6 +612,7 @@ export function buildFlow(actions, screens) {
         const entry = { action: action.action, screen: screenNames[screenIdx] };
         if (elementName) entry.elementName = elementName;
         if (action.text) entry.value = action.text;
+        if (action.attributeName) entry.attributeName = action.attributeName;
         return entry;
     });
 

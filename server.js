@@ -119,7 +119,7 @@ server.registerTool(
 server.registerTool(
     "stop_recording",
     {
-        description: "Stop recording and return a high-level flow summary. Raw actions are merged (findElement+click → 'tap'), element names are resolved from screen context, screens are auto-named by their header text, and repeated action sequences are deduplicated. Output: summary, named screens with element inventories, and a flow array of {action, elementName, screen, value?, navigatesTo?} steps.",
+        description: "Stop recording and return a high-level flow summary. Raw actions are merged (findElement+click → 'tap', findElement+getText → 'verify'), element names are resolved from screen context, screens are auto-named by their header text, and repeated action sequences are deduplicated. Output: summary, named screens with element inventories, and a flow array of {action, elementName, screen, value?, navigatesTo?, attributeName?} steps. Verify steps capture the element's current text/attribute value for assertion generation.",
         inputSchema: {
             sessionId: z.string().optional().describe("The Appium session ID. If not provided, uses the first active session."),
         },
