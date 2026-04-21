@@ -53,28 +53,81 @@ function parseIOSElement(tag, attrs) {
 }
 
 /**
+ * Checks whether a resource-id is a meaningful app-level identifier
+ * (not a generic Android/iOS system id).
+ */
+function isMeaningfulRid(rid) {
+    if (!rid) return false;
+    if (rid.startsWith('android:id/')) return false;
+    return true;
+}
+
+/**
+ * Finds the nearest ancestor with a meaningful identifier from the stack.
+ * @param {Array<{rid: string, desc: string}>} stack - Ancestor stack.
+ * @param {string} platform - 'android' or 'ios'
+ * @returns {{ parentRid: string, parentDesc: string }}
+ */
+function findMeaningfulAncestor(stack, platform) {
+    for (let i = stack.length - 1; i >= 0; i--) {
+        const ancestor = stack[i];
+        if (platform === 'android' && isMeaningfulRid(ancestor.rid)) {
+            return { parentRid: ancestor.rid, parentDesc: ancestor.desc };
+        }
+        if (platform === 'ios' && ancestor.desc) {
+            return { parentRid: '', parentDesc: ancestor.desc };
+        }
+    }
+    return { parentRid: '', parentDesc: '' };
+}
+
+/**
  * Parses page source XML (Android or iOS) and extracts interactive/labeled elements with XPath suggestions.
+ * Uses stack-based parsing to preserve parent-child hierarchy information.
  * @param {string} xml - Raw XML page source from Appium.
  * @returns {{ platform: string, clickableElements: object[], labeledElements: object[], xpathSuggestions: string[] }}
  */
 export function parsePageSource(xml) {
     const platform = detectPlatform(xml);
-    const re = /<(\S+?)\s([^>]+?)\/?\s*>/g;
+    const tagRe = /<(\/?)([^\s/>]+)(?:\s([^>]*?))?\s*(\/?)>/g;
     let m;
     const labeledElements = [];
     const clickableElements = [];
+    const stack = []; // ancestor elements for hierarchy tracking: { rid, desc }
 
-    while ((m = re.exec(xml)) !== null) {
-        const tag = m[1];
-        const attrs = m[2];
-        const el = platform === 'ios' ? parseIOSElement(tag, attrs) : parseAndroidElement(tag, attrs);
-        if (!el) continue;
+    while ((m = tagRe.exec(xml)) !== null) {
+        const [, closing, tag, attrs, selfClosing] = m;
 
-        if (el.clickable || el.isButton) {
-            clickableElements.push(el);
+        if (closing) {
+            stack.pop();
+            continue;
         }
-        if (el.text || el.desc) {
-            labeledElements.push(el);
+
+        const el = platform === 'ios'
+            ? parseIOSElement(tag, attrs || '')
+            : parseAndroidElement(tag, attrs || '');
+
+        // Find nearest meaningful ancestor for this element
+        const { parentRid, parentDesc } = findMeaningfulAncestor(stack, platform);
+
+        if (el) {
+            el.parentRid = parentRid;
+            el.parentDesc = parentDesc;
+
+            if (el.clickable || el.isButton) {
+                clickableElements.push(el);
+            }
+            if (el.text || el.desc) {
+                labeledElements.push(el);
+            }
+        }
+
+        if (!selfClosing) {
+            // Opening tag — push to stack for hierarchy tracking
+            // Extract rid/desc from attrs directly (even if element wasn't parsed)
+            const stackRid = el?.rid || (attrs?.match(/resource-id="([^"]*)"/)?.[1]) || '';
+            const stackDesc = el?.desc || (attrs?.match(/content-desc="([^"]*)"/)?.[1]) || '';
+            stack.push({ rid: stackRid, desc: stackDesc });
         }
     }
 

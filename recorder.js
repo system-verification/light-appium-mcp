@@ -407,6 +407,8 @@ export function deduplicateScreens(actions, initialPageSource, parsePageSourceFn
                 text: el.text,
                 desc: el.desc,
                 bounds: el.bounds,
+                parentRid: el.parentRid || '',
+                parentDesc: el.parentDesc || '',
             });
         }
 
@@ -438,52 +440,143 @@ export function deduplicateScreens(actions, initialPageSource, parsePageSourceFn
 // --- Flow building: high-level summary with element names, screen names, deduplication ---
 
 /**
+ * Checks whether a resource-id is a generic system identifier.
+ */
+function isGenericRid(rid) {
+    if (!rid) return true;
+    if (rid.startsWith('android:id/')) return true;
+    return false;
+}
+
+/**
+ * If an element has a meaningful parent identifier, returns the parent name.
+ * Otherwise returns null.
+ */
+function getParentName(el) {
+    if (!el) return null;
+    if (el.parentRid) return el.parentDesc || el.parentRid;
+    if (el.parentDesc) return el.parentDesc;
+    return null;
+}
+
+/**
  * Resolves a human-readable element name from a locator
  * by matching against the screen's element list.
+ * When a child element is matched and its parent has a meaningful identifier,
+ * prefers the parent name and returns the child's text as childValue.
+ *
+ * @returns {{ name: string|null, childValue: string|null }}
  */
 function resolveElementName(locator, screenElements) {
-    if (!locator || !screenElements?.length) return null;
+    if (!locator || !screenElements?.length) return { name: null, childValue: null };
 
     const { strategy, value } = locator;
     const bestName = (el) => el.desc || el.text || el.rid || null;
 
     if (strategy === "accessibility id") {
         const match = screenElements.find((e) => e.desc === value || e.rid === value);
-        return match ? bestName(match) : value;
+        if (match) {
+            const parentName = getParentName(match);
+            if (parentName && !match.rid) {
+                // Child matched by desc but has a meaningful parent
+                return { name: parentName, childValue: match.text || match.desc };
+            }
+            return { name: bestName(match), childValue: null };
+        }
+        return { name: value, childValue: null };
     }
 
     if (strategy === "id") {
         const match = screenElements.find((e) => e.rid === value);
-        return match ? bestName(match) : value.split("/").pop();
+        if (match) {
+            if (isGenericRid(value)) {
+                const parentName = getParentName(match);
+                if (parentName) {
+                    return { name: parentName, childValue: match.text || match.desc || null };
+                }
+            }
+            return { name: bestName(match), childValue: null };
+        }
+        return { name: value.split("/").pop(), childValue: null };
     }
 
     if (strategy === "-android uiautomator") {
         const textMatch = value.match(/\.text\("([^"]+)"\)/);
-        if (textMatch) return textMatch[1];
+        if (textMatch) {
+            const matchedEl = screenElements.find((e) => e.text === textMatch[1]);
+            if (matchedEl) {
+                const parentName = getParentName(matchedEl);
+                if (parentName) {
+                    return { name: parentName, childValue: textMatch[1] };
+                }
+            }
+            return { name: textMatch[1], childValue: null };
+        }
         const descMatch = value.match(/description\("([^"]+)"\)/);
-        if (descMatch) return descMatch[1];
+        if (descMatch) {
+            const matchedEl = screenElements.find((e) => e.desc === descMatch[1]);
+            if (matchedEl) {
+                const parentName = getParentName(matchedEl);
+                if (parentName) {
+                    return { name: parentName, childValue: descMatch[1] };
+                }
+            }
+            return { name: descMatch[1], childValue: null };
+        }
         const ridMatch = value.match(/resourceId\("([^"]+)"\)/);
         if (ridMatch) {
             const match = screenElements.find((e) => e.rid === ridMatch[1]);
-            return match ? bestName(match) : ridMatch[1];
+            if (match) {
+                if (isGenericRid(ridMatch[1])) {
+                    const parentName = getParentName(match);
+                    if (parentName) {
+                        return { name: parentName, childValue: match.text || match.desc || null };
+                    }
+                }
+                return { name: bestName(match), childValue: null };
+            }
+            return { name: ridMatch[1], childValue: null };
         }
-        return null;
+        return { name: null, childValue: null };
     }
 
     if (strategy === "xpath") {
         const attrMatch = value.match(
             /@(?:text|content-desc|name|label|resource-id)='([^']+)'/
         );
-        return attrMatch ? attrMatch[1] : null;
+        if (attrMatch) {
+            const text = attrMatch[1];
+            // Try to find the element and check for parent
+            const matchedEl = screenElements.find((e) => e.text === text || e.desc === text || e.rid === text);
+            if (matchedEl) {
+                const parentName = getParentName(matchedEl);
+                if (parentName && (isGenericRid(matchedEl.rid) || !matchedEl.rid)) {
+                    return { name: parentName, childValue: text };
+                }
+            }
+            return { name: text, childValue: null };
+        }
+        return { name: null, childValue: null };
     }
 
     if (strategy === "-ios predicate string") {
         const nameMatch = value.match(/name\s*==\s*['"]([^'"]+)['"]/);
         const labelMatch = value.match(/label\s*==\s*['"]([^'"]+)['"]/);
-        return nameMatch?.[1] || labelMatch?.[1] || null;
+        const ident = nameMatch?.[1] || labelMatch?.[1] || null;
+        if (ident) {
+            const matchedEl = screenElements.find((e) => e.desc === ident || e.text === ident);
+            if (matchedEl) {
+                const parentName = getParentName(matchedEl);
+                if (parentName) {
+                    return { name: parentName, childValue: ident };
+                }
+            }
+            return { name: ident, childValue: null };
+        }
+        return { name: null, childValue: null };
     }
 
-    return null;
+    return { name: null, childValue: null };
 }
 
 /**
@@ -607,11 +700,12 @@ export function buildFlow(actions, screens) {
         }
 
         const screen = screens[screenIdx];
-        const elementName = resolveElementName(action.locator, screen?.elements);
+        const { name: elementName, childValue } = resolveElementName(action.locator, screen?.elements);
 
         const entry = { action: action.action, screen: screenNames[screenIdx] };
         if (elementName) entry.elementName = elementName;
         if (action.text) entry.value = action.text;
+        else if (childValue) entry.value = childValue;
         if (action.attributeName) entry.attributeName = action.attributeName;
         return entry;
     });
