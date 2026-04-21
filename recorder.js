@@ -1,0 +1,728 @@
+// ----------------------------------------------------------------
+// Copyright (c) 2026 System Verification Sweden AB.
+// Licensed under the Apache License, Version 2.0
+// See LICENSE in the project root for license information.
+// ----------------------------------------------------------------
+
+import axios from "axios";
+
+// Map<sessionId, { interval, steps[], startedAt, appiumHost, stepIndex }>
+const recordings = new Map();
+
+// Endpoints that represent user actions worth recording
+const ACTION_PATTERNS = [
+    /\/element\/[^/]+\/click$/,
+    /\/element\/[^/]+\/value$/,
+    /\/element\/[^/]+\/clear$/,
+    /\/element\/[^/]+\/keys$/,
+    /\/actions$/,
+    /\/touch\/perform$/,
+    /\/touch\/multi\/perform$/,
+    /\/element$/,
+    /\/elements$/,
+    /\/back$/,
+    /\/forward$/,
+    /\/refresh$/,
+    /\/appium\/device\/press_key$/,
+    /\/appium\/device\/hide_keyboard$/,
+];
+
+// Endpoints that represent verification intent (reading element text/attributes)
+const VERIFY_PATTERNS = [
+    /\/element\/[^/]+\/text$/,
+    /\/element\/[^/]+\/attribute\/[^/]+$/,
+];
+
+// Extract element-id from Appium endpoint URLs
+const ELEMENT_ID_RE = /\/element\/([^/]+)\//;
+
+// Log line regex: [HTTP] --> POST /session/xxx/element/yyy/click {...}
+const LOG_LINE_RE = /\[HTTP\]\s+-->\s+(GET|POST|PUT|DELETE|PATCH)\s+(\/session\/[^\s]+?)(?:\s+(.+))?$/;
+
+// Response line regex: [HTTP] <-- GET /session/xxx/element/yyy/text 200 5.123 ms - {"value":"Hello"}
+const LOG_RESPONSE_RE = /\[HTTP\]\s+<--\s+(GET|POST|PUT|DELETE|PATCH)\s+(\/session\/[^\s]+?)\s+(\d+)\s+[\d.]+\s+ms\s+-\s+(.+)$/;
+
+function parseLogLine(line) {
+    const match = line.match(LOG_LINE_RE);
+    if (!match) return null;
+
+    const [, method, endpoint, bodyStr] = match;
+    const pathWithoutSession = endpoint.replace(/^\/session\/[^/]+/, "");
+
+    let params = null;
+    if (bodyStr) {
+        try {
+            params = JSON.parse(bodyStr.trim());
+        } catch {
+            params = { raw: bodyStr.trim() };
+        }
+    }
+
+    const segments = pathWithoutSession.split("/").filter(Boolean);
+    let action = segments[segments.length - 1];
+    if (segments.length >= 2 && segments[0] === "element") {
+        action = segments[segments.length - 1];
+    }
+
+    return { method, endpoint, pathWithoutSession, action, params };
+}
+
+function parseResponseLine(line) {
+    const match = line.match(LOG_RESPONSE_RE);
+    if (!match) return null;
+
+    const [, method, endpoint, statusCode, bodyStr] = match;
+    const pathWithoutSession = endpoint.replace(/^\/session\/[^/]+/, "");
+    let body = null;
+    if (bodyStr) {
+        try { body = JSON.parse(bodyStr.trim()); }
+        catch { body = null; }
+    }
+
+    return { method, endpoint, pathWithoutSession, statusCode, body };
+}
+
+async function fetchLogs(sessionId, appiumHost, { throwOnError = false } = {}) {
+    try {
+        const res = await axios.post(`${appiumHost}/session/${sessionId}/log`, {
+            type: "server",
+        });
+        return res.data.value || [];
+    } catch (err) {
+        const msg = err.response?.data?.value?.message || err.message || "";
+        if (msg.includes("get_server_logs") || msg.includes("insecure feature")) {
+            throw new Error(
+                "Appium server log access is blocked. " +
+                "Start Appium with: appium --allow-insecure=*:get_server_logs"
+            );
+        }
+        if (throwOnError) throw err;
+        // During polling, silently skip transient errors
+        return [];
+    }
+}
+
+async function fetchPageSource(sessionId, appiumHost) {
+    try {
+        const res = await axios.get(`${appiumHost}/session/${sessionId}/source`);
+        return res.data.value || "";
+    } catch {
+        return "";
+    }
+}
+
+async function pollLogs(sessionId) {
+    const state = recordings.get(sessionId);
+    if (!state) return;
+
+    const logs = await fetchLogs(sessionId, state.appiumHost);
+
+    // The log buffer is capped (e.g., 3000 entries) and rotates — offset-based
+    // slicing doesn't work. Instead, find new entries by timestamp comparison.
+    let newLogs;
+    if (state.lastSeenTimestamp == null) {
+        // No baseline timestamp — treat all as new (shouldn't normally happen)
+        newLogs = logs;
+    } else {
+        // Find the index of the first entry AFTER our last seen timestamp
+        let startIdx = logs.length; // default: nothing new
+        for (let i = logs.length - 1; i >= 0; i--) {
+            const ts = typeof logs[i] === "object" ? logs[i].timestamp : null;
+            if (ts != null && ts <= state.lastSeenTimestamp) {
+                startIdx = i + 1;
+                break;
+            }
+        }
+        newLogs = logs.slice(startIdx);
+    }
+
+    // Update the marker to the latest entry's timestamp
+    if (logs.length > 0) {
+        const lastEntry = logs[logs.length - 1];
+        const ts = typeof lastEntry === "object" ? lastEntry.timestamp : null;
+        if (ts != null) state.lastSeenTimestamp = ts;
+    }
+
+
+    for (const entry of newLogs) {
+        // entry may be { message: "...", level: "...", timestamp: ... } or just a string
+        const message = typeof entry === "string" ? entry : entry.message || "";
+        const entryTimestamp = typeof entry === "object" && entry.timestamp
+            ? new Date(entry.timestamp).toISOString()
+            : new Date().toISOString();
+
+        // --- Try request line ---
+        const reqParsed = parseLogLine(message);
+        if (reqParsed) {
+            const isAction = ACTION_PATTERNS.some((re) => re.test(reqParsed.pathWithoutSession));
+            const isVerify = VERIFY_PATTERNS.some((re) => re.test(reqParsed.pathWithoutSession));
+
+            if (!isAction && !isVerify) continue;
+
+            // Track findElement params for element-id mapping
+            if (reqParsed.action === "element" || reqParsed.action === "elements") {
+                state.pendingFind = reqParsed.params;
+            }
+
+            if (isVerify) {
+                // getText or getAttribute request — record as verify step
+                const elementIdMatch = reqParsed.endpoint.match(ELEMENT_ID_RE);
+                const elementId = elementIdMatch?.[1];
+                const locator = elementId ? state.elementIdMap.get(elementId) : null;
+                const attrMatch = reqParsed.pathWithoutSession.match(/\/attribute\/(.+)$/);
+
+                const pageSource = await fetchPageSource(sessionId, state.appiumHost);
+                state.pendingVerifyStepIndex = state.steps.length;
+                state.steps.push({
+                    index: state.stepIndex++,
+                    timestamp: entryTimestamp,
+                    action: attrMatch ? "attribute" : "text",
+                    endpoint: reqParsed.endpoint,
+                    params: {
+                        using: locator?.strategy,
+                        value: locator?.value,
+                        text: null, // filled from response line
+                        attributeName: attrMatch?.[1] || null,
+                    },
+                    pageSource,
+                });
+                continue;
+            }
+
+            // Regular action — existing behavior
+            const pageSource = await fetchPageSource(sessionId, state.appiumHost);
+            state.steps.push({
+                index: state.stepIndex++,
+                timestamp: entryTimestamp,
+                action: reqParsed.action,
+                endpoint: reqParsed.endpoint,
+                params: reqParsed.params,
+                pageSource,
+            });
+            continue;
+        }
+
+        // --- Try response line ---
+        const resParsed = parseResponseLine(message);
+        if (resParsed && resParsed.statusCode === "200") {
+            // findElement response: map returned element-id to the locator
+            if (/\/element$/.test(resParsed.pathWithoutSession) && resParsed.body?.value) {
+                const val = resParsed.body.value;
+                const elementId = val.ELEMENT || Object.values(val).find((v) => typeof v === "string");
+                if (elementId && state.pendingFind) {
+                    state.elementIdMap.set(elementId, {
+                        strategy: state.pendingFind.using,
+                        value: state.pendingFind.value,
+                    });
+                }
+            }
+
+            // getText/getAttribute response: attach value to pending verify step
+            const isVerifyResponse = VERIFY_PATTERNS.some((re) => re.test(resParsed.pathWithoutSession));
+            if (isVerifyResponse && state.pendingVerifyStepIndex != null) {
+                const textValue = resParsed.body?.value;
+                if (textValue != null && state.steps[state.pendingVerifyStepIndex]) {
+                    state.steps[state.pendingVerifyStepIndex].params.text = String(textValue);
+                }
+                state.pendingVerifyStepIndex = null;
+            }
+        }
+    }
+}
+
+export async function startRecording(sessionId, appiumHost) {
+    // Stop any existing recording for this session
+    if (recordings.has(sessionId)) {
+        await stopRecording(sessionId);
+    }
+
+    // Fetch existing logs to establish baseline (throw if log access is blocked)
+    const existingLogs = await fetchLogs(sessionId, appiumHost, { throwOnError: true });
+
+    // Capture initial page source
+    const initialPageSource = await fetchPageSource(sessionId, appiumHost);
+
+    // Use the last log entry's timestamp as our marker for detecting new entries,
+    // since the log buffer is capped and offset-based slicing won't work.
+    const lastEntry = existingLogs.length > 0 ? existingLogs[existingLogs.length - 1] : null;
+    const lastTimestamp = lastEntry && typeof lastEntry === "object" ? lastEntry.timestamp : null;
+
+    const state = {
+        appiumHost,
+        steps: [],
+        stepIndex: 0,
+        lastSeenTimestamp: lastTimestamp,
+        startedAt: new Date().toISOString(),
+        initialPageSource,
+        interval: setInterval(() => pollLogs(sessionId), 1000),
+        elementIdMap: new Map(),       // Appium element-id → { strategy, value }
+        pendingFind: null,             // last findElement params for element-id correlation
+        pendingVerifyStepIndex: null,  // index of step awaiting response value
+    };
+
+    recordings.set(sessionId, state);
+}
+
+export async function stopRecording(sessionId) {
+    const state = recordings.get(sessionId);
+    if (!state) {
+        return { steps: [], startedAt: null, stoppedAt: null, initialPageSource: "" };
+    }
+
+    clearInterval(state.interval);
+
+    // Do one final poll to catch any remaining logs
+    await pollLogs(sessionId);
+
+    const result = {
+        startedAt: state.startedAt,
+        stoppedAt: new Date().toISOString(),
+        initialPageSource: state.initialPageSource,
+        steps: state.steps,
+    };
+
+    recordings.delete(sessionId);
+    return result;
+}
+
+export function getRecording(sessionId) {
+    const state = recordings.get(sessionId);
+    if (!state) return null;
+    return {
+        startedAt: state.startedAt,
+        initialPageSource: state.initialPageSource,
+        steps: [...state.steps],
+    };
+}
+
+export function isRecording(sessionId) {
+    return recordings.has(sessionId);
+}
+
+// Action name mapping for consolidated output
+const ACTION_NAME_MAP = {
+    click: "tap",
+    value: "type",
+    keys: "type",
+    actions: "gesture",
+    perform: "gesture",
+    text: "verify",
+    attribute: "verify",
+};
+
+/**
+ * Consolidates raw steps by merging findElement/findElements with their
+ * subsequent action (click, value, clear, keys). Orphaned finds are dropped.
+ */
+export function consolidateSteps(steps) {
+    const consolidated = [];
+    let index = 0;
+
+    for (let i = 0; i < steps.length; i++) {
+        const step = steps[i];
+        const isFindStep = step.action === "element" || step.action === "elements";
+
+        if (isFindStep) {
+            const next = steps[i + 1];
+            // If the next step is an action on the found element, merge them
+            if (next && next.action !== "element" && next.action !== "elements") {
+                const action = ACTION_NAME_MAP[next.action] || next.action;
+                const entry = {
+                    index: index++,
+                    action,
+                    locator: step.params
+                        ? { strategy: step.params.using, value: step.params.value }
+                        : undefined,
+                    timestamp: next.timestamp,
+                    pageSource: next.pageSource,
+                };
+                if (action === "type") {
+                    entry.text = next.params?.text || next.params?.value || "";
+                }
+                if (action === "verify") {
+                    entry.text = next.params?.text || "";
+                    entry.attributeName = next.params?.attributeName || null;
+                }
+                consolidated.push(entry);
+                i++; // skip the next step since we merged it
+            }
+            // Orphaned find (not followed by an action) — drop it
+            continue;
+        }
+
+        // Standalone action (back, gesture, etc.) with no preceding find
+        const action = ACTION_NAME_MAP[step.action] || step.action;
+        const entry = {
+            index: index++,
+            action,
+            timestamp: step.timestamp,
+            pageSource: step.pageSource,
+        };
+        if (action === "verify" && step.params) {
+            // Standalone verify (no preceding find) — use embedded locator
+            if (step.params.using) {
+                entry.locator = { strategy: step.params.using, value: step.params.value };
+            }
+            entry.text = step.params.text || "";
+            entry.attributeName = step.params.attributeName || null;
+        }
+        consolidated.push(entry);
+    }
+
+    return consolidated;
+}
+
+/**
+ * Deduplicates page sources across actions and replaces them with compact
+ * parsed screen references.
+ */
+export function deduplicateScreens(actions, initialPageSource, parsePageSourceFn) {
+    // Build a fingerprint for deduplication: length + first 500 chars
+    function fingerprint(src) {
+        if (!src) return "empty";
+        return `${src.length}:${src.slice(0, 500)}`;
+    }
+
+    const screenMap = new Map(); // fingerprint → screenIndex
+    const screens = [];
+
+    function getOrCreateScreen(pageSource) {
+        if (!pageSource) return 0; // fallback to first screen
+        const fp = fingerprint(pageSource);
+        if (screenMap.has(fp)) return screenMap.get(fp);
+
+        const parsed = parsePageSourceFn(pageSource);
+        const shortClass = (cls) => cls.split(".").pop();
+
+        // Merge clickable + labeled, dedup by bounds
+        const seen = new Set();
+        const elements = [];
+        for (const el of [...parsed.clickableElements, ...parsed.labeledElements]) {
+            const key = `${el.cls}|${el.bounds}`;
+            if (seen.has(key)) continue;
+            seen.add(key);
+            elements.push({
+                cls: shortClass(el.cls),
+                rid: el.rid,
+                text: el.text,
+                desc: el.desc,
+                bounds: el.bounds,
+                parentRid: el.parentRid || '',
+                parentDesc: el.parentDesc || '',
+            });
+        }
+
+        const screenIndex = screens.length;
+        screens.push({
+            screenIndex,
+            platform: parsed.platform,
+            elements,
+        });
+        screenMap.set(fp, screenIndex);
+        return screenIndex;
+    }
+
+    // Process initial page source as screen 0
+    if (initialPageSource) {
+        getOrCreateScreen(initialPageSource);
+    }
+
+    // Replace pageSource on each action with a screenIndex
+    const compactActions = actions.map((a) => {
+        const screenIndex = getOrCreateScreen(a.pageSource);
+        const { pageSource, ...rest } = a;
+        return { ...rest, screenIndex };
+    });
+
+    return { screens, actions: compactActions };
+}
+
+// --- Flow building: high-level summary with element names, screen names, deduplication ---
+
+/**
+ * Checks whether a resource-id is a generic system identifier.
+ */
+function isGenericRid(rid) {
+    if (!rid) return true;
+    if (rid.startsWith('android:id/')) return true;
+    return false;
+}
+
+/**
+ * If an element has a meaningful parent identifier, returns the parent name.
+ * Otherwise returns null.
+ */
+function getParentName(el) {
+    if (!el) return null;
+    if (el.parentRid) return el.parentDesc || el.parentRid;
+    if (el.parentDesc) return el.parentDesc;
+    return null;
+}
+
+/**
+ * Resolves a human-readable element name from a locator
+ * by matching against the screen's element list.
+ * When a child element is matched and its parent has a meaningful identifier,
+ * prefers the parent name and returns the child's text as childValue.
+ *
+ * @returns {{ name: string|null, childValue: string|null }}
+ */
+function resolveElementName(locator, screenElements) {
+    if (!locator || !screenElements?.length) return { name: null, childValue: null };
+
+    const { strategy, value } = locator;
+    const bestName = (el) => el.desc || el.text || el.rid || null;
+
+    if (strategy === "accessibility id") {
+        const match = screenElements.find((e) => e.desc === value || e.rid === value);
+        if (match) {
+            const parentName = getParentName(match);
+            if (parentName && !match.rid) {
+                // Child matched by desc but has a meaningful parent
+                return { name: parentName, childValue: match.text || match.desc };
+            }
+            return { name: bestName(match), childValue: null };
+        }
+        return { name: value, childValue: null };
+    }
+
+    if (strategy === "id") {
+        const match = screenElements.find((e) => e.rid === value);
+        if (match) {
+            if (isGenericRid(value)) {
+                const parentName = getParentName(match);
+                if (parentName) {
+                    return { name: parentName, childValue: match.text || match.desc || null };
+                }
+            }
+            return { name: bestName(match), childValue: null };
+        }
+        return { name: value.split("/").pop(), childValue: null };
+    }
+
+    if (strategy === "-android uiautomator") {
+        const textMatch = value.match(/\.text\("([^"]+)"\)/);
+        if (textMatch) {
+            const matchedEl = screenElements.find((e) => e.text === textMatch[1]);
+            if (matchedEl) {
+                const parentName = getParentName(matchedEl);
+                if (parentName) {
+                    return { name: parentName, childValue: textMatch[1] };
+                }
+            }
+            return { name: textMatch[1], childValue: null };
+        }
+        const descMatch = value.match(/description\("([^"]+)"\)/);
+        if (descMatch) {
+            const matchedEl = screenElements.find((e) => e.desc === descMatch[1]);
+            if (matchedEl) {
+                const parentName = getParentName(matchedEl);
+                if (parentName) {
+                    return { name: parentName, childValue: descMatch[1] };
+                }
+            }
+            return { name: descMatch[1], childValue: null };
+        }
+        const ridMatch = value.match(/resourceId\("([^"]+)"\)/);
+        if (ridMatch) {
+            const match = screenElements.find((e) => e.rid === ridMatch[1]);
+            if (match) {
+                if (isGenericRid(ridMatch[1])) {
+                    const parentName = getParentName(match);
+                    if (parentName) {
+                        return { name: parentName, childValue: match.text || match.desc || null };
+                    }
+                }
+                return { name: bestName(match), childValue: null };
+            }
+            return { name: ridMatch[1], childValue: null };
+        }
+        return { name: null, childValue: null };
+    }
+
+    if (strategy === "xpath") {
+        const attrMatch = value.match(
+            /@(?:text|content-desc|name|label|resource-id)='([^']+)'/
+        );
+        if (attrMatch) {
+            const text = attrMatch[1];
+            // Try to find the element and check for parent
+            const matchedEl = screenElements.find((e) => e.text === text || e.desc === text || e.rid === text);
+            if (matchedEl) {
+                const parentName = getParentName(matchedEl);
+                if (parentName && (isGenericRid(matchedEl.rid) || !matchedEl.rid)) {
+                    return { name: parentName, childValue: text };
+                }
+            }
+            return { name: text, childValue: null };
+        }
+        return { name: null, childValue: null };
+    }
+
+    if (strategy === "-ios predicate string") {
+        const nameMatch = value.match(/name\s*==\s*['"]([^'"]+)['"]/);
+        const labelMatch = value.match(/label\s*==\s*['"]([^'"]+)['"]/);
+        const ident = nameMatch?.[1] || labelMatch?.[1] || null;
+        if (ident) {
+            const matchedEl = screenElements.find((e) => e.desc === ident || e.text === ident);
+            if (matchedEl) {
+                const parentName = getParentName(matchedEl);
+                if (parentName) {
+                    return { name: parentName, childValue: ident };
+                }
+            }
+            return { name: ident, childValue: null };
+        }
+        return { name: null, childValue: null };
+    }
+
+    return { name: null, childValue: null };
+}
+
+/**
+ * Finds which screen an action's locator best matches by checking
+ * if any screen's elements contain a matching identifier.
+ */
+function matchActionToScreen(locator, screens) {
+    if (!locator) return -1;
+
+    const { strategy, value } = locator;
+
+    for (const screen of screens) {
+        for (const el of screen.elements) {
+            if (strategy === "accessibility id" && (el.desc === value || el.rid === value))
+                return screen.screenIndex;
+            if (strategy === "id" && el.rid === value)
+                return screen.screenIndex;
+
+            if (strategy === "-android uiautomator") {
+                const ridMatch = value.match(/resourceId\("([^"]+)"\)/);
+                const textMatch = value.match(/\.text\("([^"]+)"\)/);
+                const descMatch = value.match(/description\("([^"]+)"\)/);
+                if (ridMatch && el.rid === ridMatch[1]) return screen.screenIndex;
+                if (textMatch && el.text === textMatch[1]) return screen.screenIndex;
+                if (descMatch && el.desc === descMatch[1]) return screen.screenIndex;
+            }
+
+            if (strategy === "-ios predicate string") {
+                const nameMatch = value.match(/name\s*==\s*['"]([^'"]+)['"]/);
+                const labelMatch = value.match(/label\s*==\s*['"]([^'"]+)['"]/);
+                if (nameMatch && el.desc === nameMatch[1]) return screen.screenIndex;
+                if (labelMatch && el.text === labelMatch[1]) return screen.screenIndex;
+            }
+        }
+    }
+
+    return -1;
+}
+
+/**
+ * Detects a screen name from its elements by finding
+ * the topmost text element (likely the header/title).
+ */
+function detectScreenName(screen) {
+    if (!screen?.elements?.length) return null;
+
+    const candidates = screen.elements
+        .filter((e) => e.text && /TextView|Text|StaticText/.test(e.cls))
+        .map((e) => {
+            const m = e.bounds.match(/\[\d+,(\d+)\]/);
+            return { text: e.text, y: m ? parseInt(m[1]) : Infinity };
+        })
+        .sort((a, b) => a.y - b.y);
+
+    return candidates[0]?.text || null;
+}
+
+/**
+ * Removes repeated action sequences from the flow.
+ * Matches on action+elementName signature (ignores typed values).
+ */
+function deduplicateFlow(flow, depth = 0) {
+    if (flow.length < 6 || depth > 10) return { flow, removedCount: 0 };
+
+    const sig = (f) => `${f.action}|${f.elementName || ""}`;
+
+    for (let len = Math.min(15, Math.floor(flow.length / 2)); len >= 3; len--) {
+        for (let start = 0; start <= flow.length - len * 2; start++) {
+            const pattern = [];
+            for (let k = 0; k < len; k++) pattern.push(sig(flow[start + k]));
+
+            let repeats = 1;
+            let pos = start + len;
+            while (pos + len <= flow.length) {
+                let matches = true;
+                for (let k = 0; k < len; k++) {
+                    if (sig(flow[pos + k]) !== pattern[k]) {
+                        matches = false;
+                        break;
+                    }
+                }
+                if (matches) {
+                    repeats++;
+                    pos += len;
+                } else {
+                    break;
+                }
+            }
+
+            if (repeats >= 2) {
+                const removed = (repeats - 1) * len;
+                const before = flow.slice(0, start);
+                const kept = flow.slice(start, start + len);
+                const after = flow.slice(start + len * repeats);
+                const result = deduplicateFlow([...before, ...kept, ...after], depth + 1);
+                return {
+                    flow: result.flow,
+                    removedCount: removed + result.removedCount,
+                };
+            }
+        }
+    }
+
+    return { flow, removedCount: 0 };
+}
+
+/**
+ * Builds a high-level flow summary from consolidated actions and screens.
+ * Resolves element names, detects screen names/transitions, and deduplicates.
+ */
+export function buildFlow(actions, screens) {
+    // Name each screen by its topmost text element
+    const screenNames = screens.map((s) => detectScreenName(s) || `Screen ${s.screenIndex}`);
+
+    // Resolve screen assignment and element names for each action
+    const enriched = actions.map((action) => {
+        let screenIdx = action.screenIndex;
+        if (action.locator) {
+            const matched = matchActionToScreen(action.locator, screens);
+            if (matched >= 0) screenIdx = matched;
+        }
+
+        const screen = screens[screenIdx];
+        const { name: elementName, childValue } = resolveElementName(action.locator, screen?.elements);
+
+        const entry = { action: action.action, screen: screenNames[screenIdx] };
+        if (elementName) entry.elementName = elementName;
+        if (action.text) entry.value = action.text;
+        else if (childValue) entry.value = childValue;
+        if (action.attributeName) entry.attributeName = action.attributeName;
+        return entry;
+    });
+
+    // Detect screen transitions
+    for (let i = 0; i < enriched.length - 1; i++) {
+        if (enriched[i + 1].screen !== enriched[i].screen) {
+            enriched[i].navigatesTo = enriched[i + 1].screen;
+        }
+    }
+
+    // Deduplicate repeated sequences
+    const { flow, removedCount } = deduplicateFlow(enriched);
+
+    return {
+        screenNames: screenNames.map((name, i) => ({ screenIndex: i, name })),
+        steps: flow,
+        deduplication: removedCount > 0 ? { removedActions: removedCount } : null,
+    };
+}

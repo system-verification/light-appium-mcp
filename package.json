@@ -4,7 +4,10 @@
   "type": "module",
   "main": "server.js",
   "bin": "server.js",
-  "files": ["server.js", "parser.js"],
+  "files": ["server.js", "parser.js", "recorder.js"],
+  "scripts": {
+    "test": "node --test test.js"
+  },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
     "axios": "^1.15.0",
